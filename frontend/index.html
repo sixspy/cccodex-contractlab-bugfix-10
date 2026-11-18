@@ -54,7 +54,8 @@ createApp({
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
     const contracts=ref([]), batches=ref([]), buffers=ref([]), recon=ref({});
     const form=ref({subject:'订单入站', payload_fields:'order_id,amount'});
-    const nav=['契约版本','入站校验','双写缓冲','契约对账'];
+    const nav=['契约版本','入站校验','双写缓冲','契约对账','晋升事务'];
+    const ledger=ref([]), deviations=ref([]), policy=ref({}), promoteVersion=ref('v4-shadow'), promotePath=ref('甲');
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
       err.value='';
@@ -81,6 +82,7 @@ createApp({
       buffers.value=Array.isArray(u.items)?u.items:[];
       const q=await loadJson('/api/reconcile'); if(q===null) return;
       recon.value=q&&typeof q==='object'?q:{};
+      await loadPromotion();
     }
     async function validate(){
       actionErr.value='';
@@ -88,8 +90,29 @@ createApp({
       const j=await r.json(); actionErr.value=r.ok?('校验结果：'+j.result+(j.missing?('；缺 '+j.missing.join(',')):'')):(j.detail||'失败');
       await refresh();
     }
-    onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,form,actionErr,login,logout,validate};
+    async function loadPromotion(){
+      const l=await loadJson('/api/promotion-ledger'); ledger.value=Array.isArray(l.items)?l.items:[];
+      const d=await loadJson('/api/promotion-deviations'); deviations.value=Array.isArray(d.items)?d.items:[];
+      const p=await loadJson('/api/promotion-policy'); policy.value=p&&typeof p==='object'?p:{};
+    }
+    async function promote(){
+      actionErr.value='';
+      const r=await fetch('/api/contracts/promote',{method:'POST',headers:auth(),body:JSON.stringify({version:promoteVersion.value,path:promotePath.value})});
+      const j=await r.json(); actionErr.value=r.ok?('晋升结果：'+j.result+'（'+j.path+'径）'+j.formal_version):(j.detail||'失败');
+      await refresh(); await loadPromotion();
+    }
+    async function openDraft(){
+      actionErr.value='';
+      const r=await fetch('/api/contracts/promotion-drafts',{method:'POST',headers:auth(),body:JSON.stringify({version:promoteVersion.value})});
+      const j=await r.json();
+      if(!r.ok){actionErr.value=j.detail||'草稿失败';return;}
+      const c=await fetch('/api/contracts/promotion-drafts/'+j.draft_id+'/confirm',{method:'POST',headers:auth()});
+      const k=await c.json(); actionErr.value=c.ok?('乙径草稿#'+j.draft_id+' 确认原子切：'+k.result+'（'+k.formal_version+'）'):(k.detail||'确认失败');
+      await refresh(); await loadPromotion();
+    }
+    onMounted(()=>{if(token.value){refresh();loadPromotion();}});
+    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,form,actionErr,login,logout,validate,
+      ledger,deviations,policy,promoteVersion,promotePath,promote,openDraft,loadPromotion};
   },
   template:`
   <div v-if="!token" class="login">
@@ -109,10 +132,14 @@ createApp({
     <div class="steps"><button v-for="(n,i) in nav" :key="n" :class="{on:tab===i}" @click="tab=i">{{i+1}}. {{n}}</button></div>
     <div class="card" v-show="tab===0">
       <h2>现行契约</h2>
-      <table><thead><tr><th>版本</th><th>主题</th><th>模式 / 轨</th><th>状态</th><th>必填字段</th></tr></thead>
+      <table><thead><tr><th>版本</th><th>主题</th><th>模式 / 轨</th><th>状态</th><th>必填字段</th><th>晋升</th></tr></thead>
       <tbody><tr v-for="c in contracts" :key="c.id">
-        <td>{{c.version}}</td><td>{{c.subject}}</td><td>{{c.mode}} / {{c.track}}</td><td>{{c.status}}</td><td>{{c.required_fields}}</td>
+        <td>{{c.version}}</td><td>{{c.subject}}</td><td>{{c.mode}} / {{c.track}}</td>
+        <td><span class="stamp" :class="{bad:c.track==='影子'&&c.status==='启用'}">{{c.status}}</span></td>
+        <td>{{c.required_fields}}</td>
+        <td><button v-if="c.track==='影子'" class="ghost" @click="promoteVersion=c.version;tab=4">晋升</button></td>
       </tr></tbody></table>
+      <p v-if="contracts.some(c=>c.track==='影子'&&c.status==='启用')" class="err">检测到半截指针：影子稿处于启用态，入站必填已失败闭，请走晋升事务整笔愈合。</p>
     </div>
     <div class="pair" v-show="tab===1">
       <div class="card">
@@ -140,6 +167,50 @@ createApp({
     <div class="card" v-show="tab===3">
       <h2>契约对账摘要</h2>
       <p>入站 {{recon.ingress_total}} · 通过 {{recon.passed}} · 缓冲 {{recon.buffered}} · 拒收 {{recon.rejected}} · 缓冲行 {{recon.buffer_rows}} · 对齐 {{recon.aligned}}</p>
+    </div>
+    <div v-show="tab===4">
+      <div class="card">
+        <h2>晋升事务（整笔同成同败）</h2>
+        <p class="meta">甲径：影子停用、正式启用与必填切换同一事务，失败整笔回滚；乙径：先写晋升草稿快照，确认后原子切正式指针。当天路径选定入册后不许换径。</p>
+        <div class="pair">
+          <div>
+            <label>影子版本</label><input v-model="promoteVersion"/>
+            <label>路径</label>
+            <input v-model="promotePath" placeholder="甲 或 乙（默认甲）"/>
+          </div>
+          <div style="align-self:end">
+            <button class="primary" @click="promote">甲径整笔晋升</button>
+            <button class="ghost" style="margin-left:8px" @click="openDraft">乙径草稿确认原子切</button>
+          </div>
+        </div>
+        <div class="err">{{actionErr}}</div>
+      </div>
+      <div class="card">
+        <h2>晋升失败闭册</h2>
+        <table><thead><tr><th>#</th><th>主题</th><th>影子→正式</th><th>路径</th><th>结果</th><th>说明</th><th>值班</th><th>日</th></tr></thead>
+        <tbody><tr v-for="x in ledger" :key="x.id">
+          <td>{{x.id}}</td><td>{{x.subject}}</td><td>{{x.shadow_version}}→{{x.formal_version}}</td>
+          <td>{{x.path}}</td>
+          <td><span class="stamp" :class="{bad:x.result!=='成功'}">{{x.result}}</span></td>
+          <td>{{x.detail}}</td><td>{{x.operator}}</td><td>{{x.created_day}}</td>
+        </tr></tbody></table>
+      </div>
+      <div class="card">
+        <h2>半截偏离 / 争用留痕</h2>
+        <table><thead><tr><th>#</th><th>主题</th><th>类型</th><th>说明</th><th>值班</th><th>日</th></tr></thead>
+        <tbody><tr v-for="d in deviations" :key="d.id">
+          <td>{{d.id}}</td><td>{{d.subject}}</td>
+          <td><span class="stamp" :class="{bad:d.kind!=='半截愈合'}">{{d.kind}}</span></td>
+          <td>{{d.detail}}</td><td>{{d.operator}}</td><td>{{d.created_day}}</td>
+        </tr></tbody></table>
+      </div>
+      <div class="card">
+        <h2>晋升策略附页</h2>
+        <p>当日选定路径：<b>{{policy.selected_path||'未选定'}}</b> · 无半截指针：
+          <span class="stamp" :class="{bad:!policy.half_pointer_free}">{{policy.half_pointer_free?'是':'否'}}</span></p>
+        <ul class="meta"><li v-for="(r,i) in policy.rules" :key="i">{{r}}</li></ul>
+        <p v-if="policy.splits&&Object.keys(policy.splits).length" class="err">分裂主题：{{JSON.stringify(policy.splits)}}</p>
+      </div>
     </div>
   </div>`
 }).mount('#app');
